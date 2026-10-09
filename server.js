@@ -8,22 +8,22 @@ const fs = require("fs");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Wikipedia-Anfragen: mindestens 7 Sekunden Pause nach jeder Anfrage.
 const WIKI_PAUSE_MS = 7000;
-const WIKI_MAX_ATTEMPTS = 4;
-const USER_AGENT =
-  "WikiJSON/2.2 (educational Wikipedia-to-JSON project)";
-
-// Verhindert, dass mehrere Anfragen gleichzeitig an Wikipedia gesendet werden.
-let wikiRequestQueue = Promise.resolve();
-
-// Cache für bereits geladene Artikel.
-const articleCache = new Map();
+const MAX_RETRIES = 4;
 const MAX_CACHE_ENTRIES = 300;
+
+const USER_AGENT =
+  "WikiJSON/3.0 (educational Wikipedia-to-JSON project)";
 
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PUBLIC_INDEX = path.join(PUBLIC_DIR, "index.html");
 const ROOT_INDEX = path.join(__dirname, "index.html");
+
+// Gemeinsame Warteschlange für alle Wikipedia-Anfragen.
+let wikiRequestQueue = Promise.resolve();
+
+// Cache speichert erfolgreich geladene Artikel.
+const articleCache = new Map();
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "100kb" }));
@@ -31,6 +31,14 @@ app.use(express.static(PUBLIC_DIR));
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeTitle(value) {
+  return String(value || "")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLocaleLowerCase("de");
 }
 
 function makeError(message, status = 500) {
@@ -53,8 +61,8 @@ app.get("/", (req, res) => {
   }
 
   return res.status(500).send(
-    "index.html fehlt. Lege sie unter public/index.html " +
-    "oder direkt neben server.js ab."
+    "index.html fehlt. Erstelle public/index.html " +
+    "oder lege index.html neben server.js."
   );
 });
 
@@ -63,24 +71,16 @@ app.get("/api/status", (req, res) => {
     status: "online",
     service: "Wikipedia-to-JSON",
     source: "de.wikipedia.org",
-    apiPauseSeconds: WIKI_PAUSE_MS / 1000,
+    pauseBetweenRequestsSeconds: WIKI_PAUSE_MS / 1000,
+    requestMode: "one-article-per-request",
     cacheEntries: articleCache.size,
-    queuedRequests: "sequential",
     node: process.version
   });
 });
 
 // --------------------------------------------------
-// TITEL UND LINKS PRÜFEN
+// WIKIPEDIA-LINKS PRÜFEN
 // --------------------------------------------------
-
-function normalizeTitle(title) {
-  return String(title || "")
-    .replace(/_/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLocaleLowerCase("de");
-}
 
 function parseWikipediaLink(input) {
   if (typeof input !== "string" || !input.trim()) {
@@ -92,16 +92,16 @@ function parseWikipediaLink(input) {
   try {
     url = new URL(input.trim());
   } catch {
-    throw new Error("Der Link ist keine gültige URL.");
+    throw new Error("Ungültiger Link.");
   }
 
   if (
-    !["https:", "http:"].includes(url.protocol) ||
+    !["http:", "https:"].includes(url.protocol) ||
     url.hostname.toLowerCase() !== "de.wikipedia.org" ||
     !url.pathname.startsWith("/wiki/")
   ) {
     throw new Error(
-      "Nur Links wie https://de.wikipedia.org/wiki/Artikel sind erlaubt."
+      "Nur deutsche Wikipedia-Artikellinks sind erlaubt."
     );
   }
 
@@ -125,7 +125,7 @@ function parseWikipediaLink(input) {
 }
 
 // --------------------------------------------------
-// RETRY-AFTER AUSWERTEN
+// RETRY-AFTER AUSLESEN
 // --------------------------------------------------
 
 function retryAfterMilliseconds(value) {
@@ -147,17 +147,17 @@ function retryAfterMilliseconds(value) {
 }
 
 // --------------------------------------------------
-// ZENTRALE ANFRAGEWARTESCHLANGE
+// EINZELNE WIKIPEDIA-ANFRAGE
 // --------------------------------------------------
 
-/**
- * Führt eine HTTP-Anfrage an Wikipedia aus.
+/*
+ * Diese Funktion stellt sicher, dass Wikipedia-Anfragen
+ * nacheinander ausgeführt werden.
  *
- * Wichtig:
- * - Immer nur eine Wikipedia-Anfrage gleichzeitig.
- * - Nach jeder Anfrage mindestens 7 Sekunden Pause.
- * - Die Pause erfolgt auch, wenn fetch oder das Lesen des Bodys fehlschlägt.
- * - Alle Wikipedia-API-Aufrufe müssen diese Funktion verwenden.
+ * Nach jeder HTTP-Anfrage wartet sie 7 Sekunden.
+ * Das gilt auch bei fehlgeschlagenen Anfragen.
+ *
+ * Es wird hier immer nur EIN Artikel pro API-Anfrage geladen.
  */
 function wikipediaRequest(url) {
   const task = wikiRequestQueue.then(async () => {
@@ -182,15 +182,15 @@ function wikipediaRequest(url) {
       };
     } finally {
       console.log(
-        `[Warteschlange] Wikipedia-Anfrage beendet. ` +
-        `Warte ${WIKI_PAUSE_MS / 1000} Sekunden.`
+        `[PAUSE] Anfrage abgeschlossen. ` +
+        `Nächste Wikipedia-Anfrage frühestens nach ${WIKI_PAUSE_MS / 1000} Sekunden.`
       );
 
       await sleep(WIKI_PAUSE_MS);
     }
   });
 
-  // Die Warteschlange bleibt auch nach einem Fehler funktionsfähig.
+  // Ein Fehler darf die Warteschlange nicht dauerhaft blockieren.
   wikiRequestQueue = task.then(
     () => undefined,
     () => undefined
@@ -200,13 +200,13 @@ function wikipediaRequest(url) {
 }
 
 // --------------------------------------------------
-// JSON ABRUFEN UND RATE LIMITS BEHANDELN
+// HTTP-429 UND NETZWERKFEHLER BEHANDELN
 // --------------------------------------------------
 
-async function fetchJson(url, attempts = WIKI_MAX_ATTEMPTS) {
+async function fetchJson(url) {
   let lastError;
 
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let result;
 
     try {
@@ -214,12 +214,14 @@ async function fetchJson(url, attempts = WIKI_MAX_ATTEMPTS) {
     } catch (error) {
       lastError = error;
 
-      if (attempt >= attempts) break;
+      if (attempt >= MAX_RETRIES) {
+        break;
+      }
 
       const wait = 1000 * (2 ** (attempt - 1));
 
       console.warn(
-        `[Netzwerk] Versuch ${attempt}/${attempts} fehlgeschlagen. ` +
+        `[NETZWERK] Versuch ${attempt}/${MAX_RETRIES}. ` +
         `Zusätzliche Wartezeit: ${Math.ceil(wait / 1000)} Sekunden.`
       );
 
@@ -229,22 +231,22 @@ async function fetchJson(url, attempts = WIKI_MAX_ATTEMPTS) {
 
     const retryAfter = retryAfterMilliseconds(result.retryAfter);
 
-    // HTTP 429 = zu viele Anfragen.
-    // HTTP 503 kann ebenfalls eine vorübergehende Drosselung anzeigen.
     if (result.status === 429 || result.status === 503) {
       lastError = makeError(
         `Wikipedia antwortet mit HTTP ${result.status}.`,
         result.status
       );
 
-      if (attempt >= attempts) break;
+      if (attempt >= MAX_RETRIES) {
+        break;
+      }
 
       const wait = retryAfter !== null
         ? retryAfter
         : 5000 * (2 ** (attempt - 1));
 
       console.warn(
-        `[Rate-Limit] HTTP ${result.status}. ` +
+        `[RATE LIMIT] HTTP ${result.status}. ` +
         `Zusätzliche Wartezeit: ${Math.ceil(wait / 1000)} Sekunden.`
       );
 
@@ -264,7 +266,7 @@ async function fetchJson(url, attempts = WIKI_MAX_ATTEMPTS) {
     try {
       json = JSON.parse(result.body);
     } catch {
-      throw new Error("Wikipedia hat kein gültiges JSON geliefert.");
+      throw new Error("Wikipedia lieferte kein gültiges JSON.");
     }
 
     if (json.error) {
@@ -275,15 +277,17 @@ async function fetchJson(url, attempts = WIKI_MAX_ATTEMPTS) {
       if (code === "ratelimited" || code === "maxlag") {
         lastError = new Error(`${code}: ${message}`);
 
-        if (attempt >= attempts) break;
+        if (attempt >= MAX_RETRIES) {
+          break;
+        }
 
         const wait = retryAfter !== null
           ? retryAfter
           : 5000 * (2 ** (attempt - 1));
 
         console.warn(
-          `[Wikipedia-API] ${code}. ` +
-          `Zusätzliche Wartezeit: ${Math.ceil(wait / 1000)} Sekunden.`
+          `[WIKIPEDIA API] ${code}. Warte zusätzlich ` +
+          `${Math.ceil(wait / 1000)} Sekunden.`
         );
 
         await sleep(wait);
@@ -303,7 +307,7 @@ async function fetchJson(url, attempts = WIKI_MAX_ATTEMPTS) {
 }
 
 // --------------------------------------------------
-// WIKIPEDIA-API
+// EINEN ARTIKEL LADEN
 // --------------------------------------------------
 
 function createApiUrl(parameters) {
@@ -331,54 +335,14 @@ function cacheArticle(requestedTitle, article) {
   }
 }
 
-function resolveAlias(title, aliases) {
-  let current = title;
-  const visited = new Set();
+async function getWikipediaArticle(title) {
+  const cacheKey = normalizeTitle(title);
+  const cached = articleCache.get(cacheKey);
 
-  for (let i = 0; i < 10; i++) {
-    const key = normalizeTitle(current);
-
-    if (visited.has(key)) break;
-
-    visited.add(key);
-
-    const next = aliases.get(key);
-
-    if (!next) break;
-
-    current = next;
-  }
-
-  return current;
-}
-
-/**
- * Lädt mehrere Artikel mit einer einzigen Wikipedia-API-Anfrage.
- * Maximal 10 Titel sind in einer Gruppe erlaubt.
- */
-async function getArticlesBulk(titles) {
-  const result = new Map();
-  const uncached = new Map();
-
-  for (const title of titles) {
-    const key = normalizeTitle(title);
-
-    if (result.has(key)) continue;
-
-    const cached = articleCache.get(key);
-
-    if (cached) {
-      result.set(key, { article: cached });
-    } else {
-      uncached.set(key, title);
-    }
-  }
-
-  const missingTitles = [...uncached.values()];
-
-  // Alles bereits im Cache: kein zusätzlicher Wikipedia-Aufruf.
-  if (missingTitles.length === 0) {
-    return result;
+  if (cached) {
+    // Ein Cache-Treffer erzeugt keine neue Wikipedia-Anfrage.
+    console.log(`[CACHE] ${cached.title}`);
+    return cached;
   }
 
   const apiUrl = createApiUrl({
@@ -388,82 +352,47 @@ async function getArticlesBulk(titles) {
     exsectionformat: "plain",
     redirects: "1",
     maxlag: "5",
-    titles: missingTitles.join("|"),
+    titles: title,
     format: "json",
     formatversion: "2"
   });
 
-  // Zentralisierte Warteschlange und 7-Sekunden-Pause.
+  console.log(`[ANFRAGE] Lade einzelnen Artikel: ${title}`);
+
+  // Wichtig: nur EIN Titel in dieser Anfrage.
   const json = await fetchJson(apiUrl);
+  const page = json.query?.pages?.[0];
 
-  const pages = json.query?.pages || [];
-  const aliases = new Map();
+  if (!page || page.missing || page.invalid) {
+    throw new Error(`Artikel "${title}" wurde nicht gefunden.`);
+  }
 
-  for (const entry of [
-    ...(json.query?.normalized || []),
-    ...(json.query?.redirects || [])
-  ]) {
-    aliases.set(
-      normalizeTitle(entry.from),
-      entry.to
+  if (
+    typeof page.extract !== "string" ||
+    !page.extract.trim()
+  ) {
+    throw new Error(
+      `Der Artikel "${page.title}" enthält keinen abrufbaren Text.`
     );
   }
 
-  const pagesByTitle = new Map();
+  const article = {
+    title: page.title,
+    text: page.extract,
+    url:
+      "https://de.wikipedia.org/wiki/" +
+      encodeURIComponent(page.title.replace(/ /g, "_"))
+  };
 
-  for (const page of pages) {
-    pagesByTitle.set(normalizeTitle(page.title), page);
-  }
+  cacheArticle(title, article);
 
-  for (const requestedTitle of missingTitles) {
-    const key = normalizeTitle(requestedTitle);
+  console.log(`[ERFOLG] ${article.title}`);
 
-    const resolvedTitle = resolveAlias(requestedTitle, aliases);
-
-    const page =
-      pagesByTitle.get(normalizeTitle(resolvedTitle)) ||
-      pagesByTitle.get(key);
-
-    if (!page || page.missing || page.invalid) {
-      result.set(key, {
-        error:
-          `Der Wikipedia-Artikel "${requestedTitle}" wurde nicht gefunden.`
-      });
-
-      continue;
-    }
-
-    if (
-      typeof page.extract !== "string" ||
-      !page.extract.trim()
-    ) {
-      result.set(key, {
-        error:
-          `Der Artikel "${page.title}" enthält keinen abrufbaren Text.`
-      });
-
-      continue;
-    }
-
-    const article = {
-      title: page.title,
-      text: page.extract,
-      url:
-        "https://de.wikipedia.org/wiki/" +
-        encodeURIComponent(page.title.replace(/ /g, "_"))
-    };
-
-    cacheArticle(requestedTitle, article);
-
-    result.set(key, { article });
-    result.set(normalizeTitle(page.title), { article });
-  }
-
-  return result;
+  return article;
 }
 
 // --------------------------------------------------
-// ARTIKELTEXT BEREINIGEN
+// TEXT BEREINIGEN UND AUFTEILEN
 // --------------------------------------------------
 
 function cleanArticleText(text) {
@@ -507,7 +436,7 @@ function splitLongText(text, maximumLength = 650) {
 
     if (!part) continue;
 
-    // Extrem lange Sätze anhand der Wörter teilen.
+    // Sehr lange Sätze anhand der Wörter aufteilen.
     if (part.length > maximumLength) {
       flush();
 
@@ -567,13 +496,15 @@ function createTextChunks(articleText, limit) {
 
   for (const paragraph of paragraphs) {
     for (const chunk of splitLongText(paragraph)) {
-      const text = chunk.trim();
-      const key = text.toLocaleLowerCase("de");
+      const value = chunk.trim();
+      const key = value.toLocaleLowerCase("de");
 
-      if (text.length < 40 || seen.has(key)) continue;
+      if (value.length < 40 || seen.has(key)) {
+        continue;
+      }
 
       seen.add(key);
-      chunks.push(text);
+      chunks.push(value);
 
       if (chunks.length >= limit) {
         return chunks;
@@ -581,7 +512,6 @@ function createTextChunks(articleText, limit) {
     }
   }
 
-  // Fallback für Artikel ohne brauchbare Absatzgrenzen.
   if (chunks.length === 0 && cleaned.length >= 40) {
     return splitLongText(cleaned).slice(0, limit);
   }
@@ -590,7 +520,7 @@ function createTextChunks(articleText, limit) {
 }
 
 // --------------------------------------------------
-// FRAGE-ANTWORT-DATEN ERZEUGEN
+// FRAGE-ANTWORT-PAARE ERZEUGEN
 // --------------------------------------------------
 
 function createTrainingData(article, limit) {
@@ -633,7 +563,7 @@ function removeDuplicateExamples(examples) {
 }
 
 // --------------------------------------------------
-// HAUPT-API: MEHRERE WIKIPEDIA-LINKS -> JSON
+// MEHRERE LINKS VERARBEITEN: EINZELN UND NACHEINANDER
 // --------------------------------------------------
 
 app.post("/api/convert", async (req, res) => {
@@ -649,7 +579,9 @@ app.post("/api/convert", async (req, res) => {
 
   if (urls.length > 10) {
     return res.status(400).json({
-      error: "Maximal 10 Links pro Anfrage. Bitte in Gruppen senden.",
+      error:
+        "Maximal 10 Links pro Anfrage. " +
+        "Die Links werden trotzdem einzeln abgefragt.",
       data: [],
       articles: []
     });
@@ -657,97 +589,33 @@ app.post("/api/convert", async (req, res) => {
 
   const limit = Number(maxPerArticle);
 
-  if (
-    !Number.isInteger(limit) ||
-    limit < 1 ||
-    limit > 100
-  ) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
     return res.status(400).json({
-      error: "Die Anzahl muss zwischen 1 und 100 liegen.",
+      error: "Beispiele pro Artikel müssen zwischen 1 und 100 liegen.",
       data: [],
       articles: []
     });
   }
 
-  const requests = urls.map(input => {
-    try {
-      return {
-        input,
-        title: parseWikipediaLink(input)
-      };
-    } catch (error) {
-      return {
-        input,
-        error: error.message
-      };
-    }
-  });
-
-  const validTitles = requests
-    .filter(item => item.title)
-    .map(item => item.title);
-
-  let retrieved = new Map();
-  let bulkError = null;
-
-  if (validTitles.length > 0) {
-    try {
-      retrieved = await getArticlesBulk(validTitles);
-    } catch (error) {
-      bulkError = error;
-
-      console.error(
-        "[Wikipedia-Bulk-Fehler]",
-        error.message
-      );
-    }
-  }
-
   const allExamples = [];
   const articles = [];
 
-  for (const item of requests) {
-    if (item.error) {
-      articles.push({
-        title: String(item.input).slice(0, 150),
-        count: 0,
-        error: item.error
-      });
+  // JEDER Link wird einzeln verarbeitet.
+  // getWikipediaArticle wartet nach seiner HTTP-Anfrage 7 Sekunden.
+  for (let index = 0; index < urls.length; index++) {
+    const input = urls[index];
 
-      continue;
-    }
-
-    if (bulkError) {
-      articles.push({
-        title: item.title,
-        count: 0,
-        error: bulkError.message
-      });
-
-      continue;
-    }
-
-    const entry = retrieved.get(normalizeTitle(item.title));
-
-    if (!entry || entry.error || !entry.article) {
-      articles.push({
-        title: item.title,
-        count: 0,
-        error:
-          entry?.error ||
-          "Der Artikel konnte nicht geladen werden."
-      });
-
-      continue;
-    }
+    let title;
 
     try {
-      const article = entry.article;
+      title = parseWikipediaLink(input);
 
-      const examples = createTrainingData(
-        article,
-        limit
+      console.log(
+        `[FORTSCHRITT] Link ${index + 1} von ${urls.length}: ${title}`
       );
+
+      const article = await getWikipediaArticle(title);
+      const examples = createTrainingData(article, limit);
 
       allExamples.push(...examples);
 
@@ -761,13 +629,20 @@ app.post("/api/convert", async (req, res) => {
       });
 
       console.log(
-        `[Erfolg] ${article.title}: ${examples.length} Beispiele`
+        `[FERTIG] ${index + 1}/${urls.length}: ` +
+        `${article.title}, ${examples.length} Beispiele`
       );
     } catch (error) {
+      const message = error?.message || "Unbekannter Fehler";
+
+      console.error(
+        `[ARTIKEL-FEHLER] Link ${index + 1}: ${message}`
+      );
+
       articles.push({
-        title: item.title,
+        title: title || String(input).slice(0, 150),
         count: 0,
-        error: error.message
+        error: message
       });
     }
   }
@@ -775,15 +650,14 @@ app.post("/api/convert", async (req, res) => {
   const data = removeDuplicateExamples(allExamples);
 
   const failed = articles.filter(
-    item => item.error || item.count === 0
+    article => article.error || article.count === 0
   ).length;
 
   if (data.length === 0) {
-    return res.status(bulkError ? 503 : 422).json({
-      error: bulkError
-        ? "Wikipedia ist momentan nicht erreichbar oder drosselt Anfragen. " +
-          "Bitte warte und versuche es erneut."
-        : "Es wurden keine geeigneten Trainingsbeispiele erstellt.",
+    return res.status(422).json({
+      error:
+        "Es wurden keine Trainingsbeispiele erstellt. " +
+        "Prüfe die Links und die Render-Logs.",
       data: [],
       articles,
       total: 0,
@@ -813,7 +687,7 @@ app.use((error, req, res, next) => {
     });
   }
 
-  console.error("[Serverfehler]", error);
+  console.error("[SERVERFEHLER]", error);
 
   if (res.headersSent) {
     return next(error);
@@ -831,7 +705,7 @@ app.use((error, req, res, next) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server läuft auf Port ${PORT}`);
   console.log("Wikipedia-JSON-Konverter ist bereit.");
-  console.log(`Pause nach jeder API-Anfrage: ${WIKI_PAUSE_MS / 1000} Sekunden`);
-  console.log("Quelle: deutsche Wikipedia-API");
-  console.log("Status-Endpunkt: /api/status");
+  console.log("Anfragen: ein Artikel pro Wikipedia-API-Aufruf.");
+  console.log("Pause nach jeder HTTP-Anfrage: 7 Sekunden.");
+  console.log("Status: /api/status");
 });
