@@ -1,0 +1,144 @@
+
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wikipedia zu JSON</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px; background: #10131b;
+      color: #f2f4fa; font-family: Arial, sans-serif;
+    }
+    main { max-width: 850px; margin: auto; }
+    h1 { color: #83aaff; }
+    p { color: #b9c1d4; line-height: 1.5; }
+    textarea, input, button {
+      width: 100%; padding: 13px; border-radius: 10px;
+      border: 1px solid #343c50; font: inherit;
+    }
+    textarea, input {
+      background: #191e2a; color: white; margin: 8px 0 14px;
+    }
+    textarea { min-height: 190px; resize: vertical; }
+    button {
+      background: #477cff; color: white; font-weight: bold;
+      cursor: pointer; border: 0; margin: 5px 0;
+    }
+    button:disabled { opacity: .5; cursor: wait; }
+    #status { white-space: pre-wrap; margin: 16px 0; }
+    pre {
+      white-space: pre-wrap; overflow-wrap: anywhere;
+      background: #191e2a; padding: 15px; border-radius: 10px;
+      max-height: 400px; overflow: auto;
+    }
+    .hint { font-size: 13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Wikipedia → JSON</h1>
+  <p>Gib deutsche Wikipedia-Links ein. Der Server liest die Artikel
+     und erstellt daraus Frage-Antwort-Beispiele für deine KI.</p>
+
+  <label for="links">Wikipedia-Links (ein Link pro Zeile)</label>
+  <textarea id="links" placeholder="https://de.wikipedia.org/wiki/Künstliche_Intelligenz"></textarea>
+
+  <label for="max">Maximale Beispiele pro Artikel</label>
+  <input id="max" type="number" min="1" max="100" value="20">
+
+  <button id="start">Artikel lesen und JSON erstellen</button>
+  <button id="download" disabled>JSON herunterladen</button>
+  <button id="copy" disabled>JSON kopieren</button>
+
+  <div id="status" role="status">Bereit.</div>
+  <h2>Vorschau</h2>
+  <pre id="preview">Hier erscheint deine JSON-Datei.</pre>
+  <p class="hint">Es werden nur Artikel auf de.wikipedia.org akzeptiert.
+     Prüfe die erzeugten Antworten vor dem Training.</p>
+</main>
+
+<script>
+const links = document.getElementById("links");
+const maxInput = document.getElementById("max");
+const start = document.getElementById("start");
+const download = document.getElementById("download");
+const copy = document.getElementById("copy");
+const status = document.getElementById("status");
+const preview = document.getElementById("preview");
+
+let result = [];
+
+start.addEventListener("click", async () => {
+  const urls = links.value.split(/\n/)
+    .map(x => x.trim()).filter(Boolean);
+
+  if (!urls.length) {
+    status.textContent = "Bitte mindestens einen Wikipedia-Link eingeben.";
+    return;
+  }
+
+  start.disabled = true;
+  download.disabled = true;
+  copy.disabled = true;
+  status.textContent = "Lese Wikipedia-Artikel …";
+
+  try {
+    const response = await fetch("/api/convert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        urls,
+        maxPerArticle: Number(maxInput.value)
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error || "Unbekannter Serverfehler");
+    }
+
+    result = data.data;
+    preview.textContent = JSON.stringify(result, null, 2);
+    status.textContent =
+      `Fertig! ${result.length} Beispiele erstellt.\n` +
+      data.articles.map(a =>
+        `${a.title}: ${a.count} Beispiele` +
+        (a.error ? ` – ${a.error}` : "")
+      ).join("\n");
+
+    download.disabled = result.length === 0;
+    copy.disabled = result.length === 0;
+  } catch (error) {
+    status.textContent = "Fehler: " + error.message;
+  } finally {
+    start.disabled = false;
+  }
+});
+
+download.addEventListener("click", () => {
+  const blob = new Blob(
+    [JSON.stringify(result, null, 2)],
+    { type: "application/json;charset=utf-8" }
+  );
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "trainingsdaten.json";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+copy.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
+    status.textContent = "JSON wurde in die Zwischenablage kopiert.";
+  } catch {
+    status.textContent = "Kopieren nicht möglich. Nutze den Download.";
+  }
+});
+</script>
+</body>
+</html>
