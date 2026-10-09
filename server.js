@@ -6,17 +6,25 @@ const fs = require("fs");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Trage in Render unter Environment die Variable WIKIJSON_CONTACT ein.
+// Als Wert eignet sich die öffentliche URL deines GitHub-Projekts.
+const CONTACT =
+  process.env.WIKIJSON_CONTACT ||
+  process.env.RENDER_EXTERNAL_URL ||
+  "https://github.com/";
+
+const USER_AGENT = `WikiJSON/2.1 (${CONTACT})`;
+
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PUBLIC_INDEX = path.join(PUBLIC_DIR, "index.html");
 const ROOT_INDEX = path.join(__dirname, "index.html");
 
-const USER_AGENT =
-  "WikiJSON/1.0 (educational project; Node.js)";
+// Bereits geladene Artikel werden im Arbeitsspeicher zwischengespeichert.
+const articleCache = new Map();
+const MAX_CACHE_ENTRIES = 300;
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "100kb" }));
-
-// Statische Dateien, zum Beispiel public/index.html
 app.use(express.static(PUBLIC_DIR));
 
 app.get("/", (req, res) => {
@@ -29,18 +37,18 @@ app.get("/", (req, res) => {
   }
 
   return res.status(500).send(
-    "index.html fehlt. Lege sie unter public/index.html " +
-    "oder direkt neben server.js ab."
+    "index.html fehlt. Lege die Datei unter public/index.html " +
+    "oder neben server.js ab."
   );
 });
 
-// Statuskontrolle für Render
 app.get("/api/status", (req, res) => {
   res.json({
     status: "online",
     service: "Wikipedia-to-JSON",
     source: "de.wikipedia.org",
-    searchEngine: "Wikipedia API",
+    mode: "bulk-api-with-cache",
+    cacheEntries: articleCache.size,
     node: process.version
   });
 });
@@ -49,71 +57,38 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Ruft eine JSON-Adresse mit begrenzten Wiederholungen ab.
- */
-async function fetchJson(url, attempts = 3) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          "User-Agent": USER_AGENT,
-          "Accept": "application/json",
-          "Accept-Language": "de-DE,de;q=0.9"
-        },
-        signal: AbortSignal.timeout(20000),
-        redirect: "follow"
-      });
-
-      if (!response.ok) {
-        throw new Error(`Wikipedia antwortet mit HTTP ${response.status}.`);
-      }
-
-      const contentType = response.headers.get("content-type") || "";
-
-      if (
-        contentType &&
-        !contentType.includes("json") &&
-        !contentType.includes("text/plain")
-      ) {
-        throw new Error("Wikipedia hat keine JSON-Antwort geliefert.");
-      }
-
-      const json = await response.json();
-
-      if (json.error) {
-        throw new Error(
-          json.error.info || "Die Wikipedia-API meldet einen Fehler."
-        );
-      }
-
-      return json;
-    } catch (error) {
-      lastError = error;
-
-      console.warn(
-        `[Wikipedia API] Versuch ${attempt}/${attempts}: ${error.message}`
-      );
-
-      if (attempt < attempts) {
-        await sleep(attempt * 700);
-      }
-    }
-  }
-
-  throw new Error(
-    `Wikipedia konnte nach ${attempts} Versuchen nicht erreicht werden: ` +
-    (lastError?.message || "Unbekannter Netzwerkfehler")
-  );
+function normalizeTitle(title) {
+  return String(title || "")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLocaleLowerCase("de");
 }
 
-/**
- * Akzeptiert ausschließlich normale Artikel-Links
- * der deutschen Wikipedia.
- */
+function makeError(message, status) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function retryAfterMilliseconds(value) {
+  if (!value) return null;
+
+  const seconds = Number(value);
+
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+
+  const timestamp = Date.parse(value);
+
+  if (Number.isFinite(timestamp)) {
+    return Math.max(0, timestamp - Date.now());
+  }
+
+  return null;
+}
+
 function parseWikipediaLink(input) {
   if (typeof input !== "string" || !input.trim()) {
     throw new Error("Der Link ist leer.");
@@ -128,30 +103,28 @@ function parseWikipediaLink(input) {
   }
 
   if (
-    !["http:", "https:"].includes(url.protocol) ||
+    !["https:", "http:"].includes(url.protocol) ||
     url.hostname.toLowerCase() !== "de.wikipedia.org" ||
     !url.pathname.startsWith("/wiki/")
   ) {
     throw new Error(
-      "Nur Links wie https://de.wikipedia.org/wiki/Artikel sind erlaubt."
+      "Nur deutsche Wikipedia-Links sind erlaubt."
     );
   }
 
   let title;
 
   try {
-    const encodedTitle = url.pathname
-      .slice("/wiki/".length)
-      .split("/")[0];
-
-    title = decodeURIComponent(encodedTitle).replace(/_/g, " ").trim();
+    title = decodeURIComponent(
+      url.pathname.slice("/wiki/".length).split("/")[0]
+    ).replace(/_/g, " ").trim();
   } catch {
     throw new Error("Der Artikelname ist ungültig kodiert.");
   }
 
   if (!title || title.length > 200 || title.includes(":")) {
     throw new Error(
-      "Bitte einen normalen Wikipedia-Artikel verlinken, keine Spezialseite."
+      "Bitte einen normalen Wikipedia-Artikel verlinken."
     );
   }
 
@@ -159,57 +132,279 @@ function parseWikipediaLink(input) {
 }
 
 /**
- * Erstellt eine API-Adresse nur für die festgelegte Wikipedia-Domain.
+ * Fragt die Wikipedia-API ab.
+ *
+ * Bei HTTP 429 oder 503 werden Retry-After und exponentielles
+ * Backoff berücksichtigt. Netzwerkfehler werden ebenfalls
+ * begrenzt erneut versucht.
  */
+async function fetchJson(url, attempts = 4) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let response;
+
+    try {
+      response = await fetch(url, {
+        method: "GET",
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Accept": "application/json",
+          "Accept-Language": "de-DE,de;q=0.9"
+        },
+        signal: AbortSignal.timeout(20000),
+        redirect: "follow"
+      });
+    } catch (error) {
+      lastError = error;
+
+      if (attempt >= attempts) break;
+
+      const wait = 1000 * (2 ** (attempt - 1));
+
+      console.warn(
+        `[Netzwerk] Versuch ${attempt}/${attempts} fehlgeschlagen. ` +
+        `Warte ${wait} ms.`
+      );
+
+      await sleep(wait);
+      continue;
+    }
+
+    const retryAfter = retryAfterMilliseconds(
+      response.headers.get("retry-after")
+    );
+
+    if (response.status === 429 || response.status === 503) {
+      lastError = makeError(
+        `Wikipedia antwortet mit HTTP ${response.status}.`,
+        response.status
+      );
+
+      if (attempt >= attempts) break;
+
+      // Einen vorhandenen Retry-After-Wert niemals unterschreiten.
+      // Ohne Header mindestens 5 Sekunden und dann exponentiell länger warten.
+      const wait = retryAfter !== null
+        ? retryAfter
+        : 5000 * (2 ** (attempt - 1));
+
+      console.warn(
+        `[Rate-Limit] HTTP ${response.status}. ` +
+        `Warte ${Math.ceil(wait / 1000)} Sekunden.`
+      );
+
+      await sleep(wait);
+      continue;
+    }
+
+    if (!response.ok) {
+      const details = await response.text().catch(() => "");
+
+      throw makeError(
+        `Wikipedia antwortet mit HTTP ${response.status}. ` +
+        details.slice(0, 150),
+        response.status
+      );
+    }
+
+    let json;
+
+    try {
+      json = await response.json();
+    } catch {
+      throw new Error("Wikipedia hat kein gültiges JSON geliefert.");
+    }
+
+    if (json.error) {
+      const code = json.error.code || "";
+      const message = json.error.info || "Unbekannter API-Fehler";
+
+      if (
+        code === "ratelimited" ||
+        code === "maxlag"
+      ) {
+        lastError = new Error(
+          `Wikipedia-API: ${code}: ${message}`
+        );
+
+        if (attempt >= attempts) break;
+
+        const wait = retryAfter !== null
+          ? retryAfter
+          : 5000 * (2 ** (attempt - 1));
+
+        console.warn(
+          `[Wikipedia API] ${code}; warte ${Math.ceil(wait / 1000)} Sekunden.`
+        );
+
+        await sleep(wait);
+        continue;
+      }
+
+      throw new Error(`Wikipedia-API: ${message}`);
+    }
+
+    return json;
+  }
+
+  throw new Error(
+    lastError?.message ||
+    "Wikipedia konnte nach mehreren Versuchen nicht erreicht werden."
+  );
+}
+
 function createApiUrl(parameters) {
   const url = new URL("https://de.wikipedia.org/w/api.php");
   url.search = new URLSearchParams(parameters).toString();
   return url.toString();
 }
 
+function cacheArticle(requestedTitle, article) {
+  const keys = [
+    normalizeTitle(requestedTitle),
+    normalizeTitle(article.title)
+  ];
+
+  for (const key of keys) {
+    // Ein erneuter Zugriff macht den Eintrag zum neuesten.
+    articleCache.delete(key);
+    articleCache.set(key, article);
+  }
+
+  while (articleCache.size > MAX_CACHE_ENTRIES) {
+    const oldestKey = articleCache.keys().next().value;
+    articleCache.delete(oldestKey);
+  }
+}
+
+function resolveAlias(title, aliases) {
+  let current = title;
+  const visited = new Set();
+
+  for (let i = 0; i < 10; i++) {
+    const key = normalizeTitle(current);
+
+    if (visited.has(key)) break;
+    visited.add(key);
+
+    const next = aliases.get(key);
+
+    if (!next) break;
+
+    current = next;
+  }
+
+  return current;
+}
+
 /**
- * Lädt den Artikel über seinen Titel.
- * redirects=1 erlaubt Weiterleitungen innerhalb Wikipedias.
+ * Lädt bis zu 10 Artikel in E I N E R Wikipedia-API-Anfrage.
+ * Die Funktion liefert für jeden angefragten Titel einen Artikel
+ * oder einen individuellen Fehler.
  */
-async function getWikipediaArticle(requestedTitle) {
+async function getArticlesBulk(titles) {
+  const result = new Map();
+  const uncached = new Map();
+
+  for (const title of titles) {
+    const key = normalizeTitle(title);
+
+    if (result.has(key)) continue;
+
+    const cached = articleCache.get(key);
+
+    if (cached) {
+      result.set(key, { article: cached });
+    } else {
+      uncached.set(key, title);
+    }
+  }
+
+  const missingTitles = [...uncached.values()];
+
+  if (missingTitles.length === 0) {
+    return result;
+  }
+
+  // Wikipedia kann mehrere Titel in einem Request bearbeiten.
+  // Das verringert die Anzahl der API-Anfragen deutlich.
   const apiUrl = createApiUrl({
     action: "query",
     prop: "extracts",
     explaintext: "1",
     exsectionformat: "plain",
     redirects: "1",
-    titles: requestedTitle,
+    maxlag: "5",
+    titles: missingTitles.join("|"),
     format: "json",
     formatversion: "2"
   });
 
+  // Genau ein Netzwerkaufruf für die ganze Gruppe.
   const json = await fetchJson(apiUrl);
-  const page = json.query?.pages?.[0];
 
-  if (!page || page.missing || page.invalid) {
-    throw new Error(
-      `Der Wikipedia-Artikel "${requestedTitle}" wurde nicht gefunden.`
+  const pages = json.query?.pages || [];
+  const aliases = new Map();
+
+  for (const entry of [
+    ...(json.query?.normalized || []),
+    ...(json.query?.redirects || [])
+  ]) {
+    aliases.set(
+      normalizeTitle(entry.from),
+      entry.to
     );
   }
 
-  if (typeof page.extract !== "string" || !page.extract.trim()) {
-    throw new Error(
-      `Der Artikel "${page.title}" enthält keinen abrufbaren Text.`
-    );
+  const pagesByTitle = new Map();
+
+  for (const page of pages) {
+    pagesByTitle.set(normalizeTitle(page.title), page);
   }
 
-  return {
-    title: page.title,
-    text: page.extract,
-    url:
-      "https://de.wikipedia.org/wiki/" +
-      encodeURIComponent(page.title.replace(/ /g, "_"))
-  };
+  for (const requestedTitle of missingTitles) {
+    const key = normalizeTitle(requestedTitle);
+    const resolvedTitle = resolveAlias(requestedTitle, aliases);
+
+    const page =
+      pagesByTitle.get(normalizeTitle(resolvedTitle)) ||
+      pagesByTitle.get(key);
+
+    if (!page || page.missing || page.invalid) {
+      result.set(key, {
+        error: `Artikel "${requestedTitle}" wurde nicht gefunden.`
+      });
+      continue;
+    }
+
+    if (
+      typeof page.extract !== "string" ||
+      !page.extract.trim()
+    ) {
+      result.set(key, {
+        error: `Artikel "${page.title}" enthält keinen abrufbaren Text.`
+      });
+      continue;
+    }
+
+    const article = {
+      title: page.title,
+      text: page.extract,
+      url:
+        "https://de.wikipedia.org/wiki/" +
+        encodeURIComponent(page.title.replace(/ /g, "_"))
+    };
+
+    cacheArticle(requestedTitle, article);
+
+    result.set(key, { article });
+    result.set(normalizeTitle(page.title), { article });
+  }
+
+  return result;
 }
 
-/**
- * Bereinigt den Artikeltext.
- */
 function cleanArticleText(text) {
   return String(text || "")
     .replace(/\r/g, "\n")
@@ -221,10 +416,6 @@ function cleanArticleText(text) {
     .trim();
 }
 
-/**
- * Zerlegt langen Text möglichst an Satzgrenzen.
- * Sehr lange Sätze werden notfalls anhand der Wörter geteilt.
- */
 function splitLongText(text, maximumLength = 650) {
   const clean = text.trim();
 
@@ -238,10 +429,8 @@ function splitLongText(text, maximumLength = 650) {
   let current = "";
 
   function flush() {
-    const value = current.trim();
-
-    if (value.length >= 40) {
-      chunks.push(value);
+    if (current.trim().length >= 40) {
+      chunks.push(current.trim());
     }
 
     current = "";
@@ -263,7 +452,7 @@ function splitLongText(text, maximumLength = 650) {
           wordChunk &&
           (wordChunk + " " + word).length > maximumLength
         ) {
-          if (wordChunk.trim().length >= 40) {
+          if (wordChunk.length >= 40) {
             chunks.push(wordChunk.trim());
           }
 
@@ -273,7 +462,7 @@ function splitLongText(text, maximumLength = 650) {
         }
       }
 
-      if (wordChunk.trim().length >= 40) {
+      if (wordChunk.length >= 40) {
         chunks.push(wordChunk.trim());
       }
 
@@ -296,54 +485,28 @@ function splitLongText(text, maximumLength = 650) {
   return chunks;
 }
 
-/**
- * Bildet Textabschnitte, auch wenn Wikipedia nur einzelne
- * Zeilen statt vollständiger Absätze zurückgibt.
- */
 function createTextChunks(articleText, limit) {
   const cleaned = cleanArticleText(articleText);
 
   if (!cleaned) return [];
 
-  const lines = cleaned
+  const paragraphs = cleaned
     .split(/\n+/)
-    .map(line => line.trim())
+    .map(part => part.trim())
     .filter(Boolean);
-
-  const blocks = [];
-  let current = "";
-
-  for (const line of lines) {
-    if (
-      current &&
-      current.length + line.length + 1 > 550
-    ) {
-      blocks.push(current.trim());
-      current = line;
-    } else {
-      current = (current + " " + line).trim();
-    }
-  }
-
-  if (current) blocks.push(current.trim());
-
-  // Fallback, wenn der Artikel keine Absatzstruktur hat.
-  if (blocks.length === 0 && cleaned.length > 0) {
-    blocks.push(cleaned);
-  }
 
   const chunks = [];
   const seen = new Set();
 
-  for (const block of blocks) {
-    for (const chunk of splitLongText(block)) {
-      const value = chunk.trim();
-      const key = value.toLocaleLowerCase("de");
+  for (const paragraph of paragraphs) {
+    for (const chunk of splitLongText(paragraph)) {
+      const text = chunk.trim();
+      const key = text.toLocaleLowerCase("de");
 
-      if (value.length < 40 || seen.has(key)) continue;
+      if (text.length < 40 || seen.has(key)) continue;
 
       seen.add(key);
-      chunks.push(value);
+      chunks.push(text);
 
       if (chunks.length >= limit) {
         return chunks;
@@ -351,13 +514,14 @@ function createTextChunks(articleText, limit) {
     }
   }
 
+  // Fallback, falls der Artikel keine brauchbaren Absatzgrenzen hat.
+  if (chunks.length === 0 && cleaned.length >= 40) {
+    return splitLongText(cleaned).slice(0, limit);
+  }
+
   return chunks;
 }
 
-/**
- * Erstellt Trainingsbeispiele in genau diesem Format:
- * { "frage": "...", "antwort": "..." }
- */
 function createTrainingData(article, limit) {
   const chunks = createTextChunks(article.text, limit);
 
@@ -369,24 +533,13 @@ function createTrainingData(article, limit) {
   }));
 }
 
-/**
- * Entfernt identische Frage-Antwort-Paare aus allen Artikeln.
- */
 function removeDuplicateExamples(examples) {
   const seen = new Set();
   const result = [];
 
   for (const item of examples) {
-    if (
-      !item ||
-      typeof item.frage !== "string" ||
-      typeof item.antwort !== "string"
-    ) {
-      continue;
-    }
-
-    const frage = item.frage.trim();
-    const antwort = item.antwort.trim();
+    const frage = String(item.frage || "").trim();
+    const antwort = String(item.antwort || "").trim();
 
     if (!frage || !antwort) continue;
 
@@ -404,15 +557,12 @@ function removeDuplicateExamples(examples) {
   return result;
 }
 
-// Wandelt eine oder mehrere Wikipedia-URLs gemeinsam um.
 app.post("/api/convert", async (req, res) => {
-  const body = req.body || {};
-  const urls = body.urls;
-  const maxPerArticle = Number(body.maxPerArticle ?? 20);
+  const { urls, maxPerArticle = 20 } = req.body || {};
 
   if (!Array.isArray(urls) || urls.length === 0) {
     return res.status(400).json({
-      error: "Bitte mindestens einen Wikipedia-Link angeben.",
+      error: "Bitte mindestens einen Wikipedia-Link eingeben.",
       data: [],
       articles: []
     });
@@ -420,45 +570,88 @@ app.post("/api/convert", async (req, res) => {
 
   if (urls.length > 10) {
     return res.status(400).json({
-      error: "Maximal 10 Links pro Anfrage. Verarbeite mehrere Gruppen.",
+      error: "Maximal 10 Links pro Anfrage. Bitte gruppenweise senden.",
       data: [],
       articles: []
     });
   }
 
-  if (
-    !Number.isInteger(maxPerArticle) ||
-    maxPerArticle < 1 ||
-    maxPerArticle > 100
-  ) {
+  const limit = Number(maxPerArticle);
+
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
     return res.status(400).json({
-      error: "maxPerArticle muss eine Zahl zwischen 1 und 100 sein.",
+      error: "Beispiele pro Artikel müssen zwischen 1 und 100 liegen.",
       data: [],
       articles: []
     });
+  }
+
+  const requests = urls.map(input => {
+    try {
+      return {
+        input,
+        title: parseWikipediaLink(input)
+      };
+    } catch (error) {
+      return {
+        input,
+        error: error.message
+      };
+    }
+  });
+
+  const validTitles = requests
+    .filter(item => item.title)
+    .map(item => item.title);
+
+  let retrieved = new Map();
+  let bulkError = null;
+
+  if (validTitles.length > 0) {
+    try {
+      retrieved = await getArticlesBulk(validTitles);
+    } catch (error) {
+      bulkError = error;
+      console.error("[Wikipedia-Bulk-Fehler]", error.message);
+    }
   }
 
   const allExamples = [];
   const articles = [];
 
-  // Nacheinander abrufen, damit nicht zu viele Anfragen gleichzeitig
-  // an Wikipedia geschickt werden.
-  for (const input of urls) {
-    let requestedTitle = String(input || "").slice(0, 200);
+  for (const item of requests) {
+    if (item.error) {
+      articles.push({
+        title: String(item.input).slice(0, 150),
+        count: 0,
+        error: item.error
+      });
+      continue;
+    }
+
+    if (bulkError) {
+      articles.push({
+        title: item.title,
+        count: 0,
+        error: bulkError.message
+      });
+      continue;
+    }
+
+    const entry = retrieved.get(normalizeTitle(item.title));
+
+    if (!entry || entry.error || !entry.article) {
+      articles.push({
+        title: item.title,
+        count: 0,
+        error: entry?.error || "Artikel konnte nicht geladen werden."
+      });
+      continue;
+    }
 
     try {
-      requestedTitle = parseWikipediaLink(input);
-
-      console.log(
-        `[Verarbeitung] Wikipedia-Artikel angefragt: ${requestedTitle}`
-      );
-
-      const article = await getWikipediaArticle(requestedTitle);
-
-      const examples = createTrainingData(
-        article,
-        maxPerArticle
-      );
+      const article = entry.article;
+      const examples = createTrainingData(article, limit);
 
       allExamples.push(...examples);
 
@@ -466,43 +659,38 @@ app.post("/api/convert", async (req, res) => {
         title: article.title,
         url: article.url,
         count: examples.length,
-        error: examples.length === 0
-          ? "Es konnten keine geeigneten Textabschnitte erstellt werden."
-          : null
+        error: examples.length
+          ? null
+          : "Keine ausreichend langen Textabschnitte gefunden."
       });
 
       console.log(
         `[Erfolg] ${article.title}: ${examples.length} Beispiele`
       );
     } catch (error) {
-      const message = error?.message || "Unbekannter Fehler";
-
-      console.error(
-        `[Artikel-Fehler] ${requestedTitle}: ${message}`
-      );
-
       articles.push({
-        title: requestedTitle,
+        title: item.title,
         count: 0,
-        error: message
+        error: error.message
       });
     }
   }
 
   const data = removeDuplicateExamples(allExamples);
+  const failed = articles.filter(
+    item => item.error || item.count === 0
+  ).length;
 
-  // Auch bei einem Teilerfolg erfolgreiche Beispiele zurückgeben.
   if (data.length === 0) {
-    return res.status(422).json({
-      error:
-        "Es wurden keine Trainingsbeispiele erstellt. " +
-        "Prüfe die Artikel-Links und die Render-Logs.",
+    return res.status(bulkError ? 503 : 422).json({
+      error: bulkError
+        ? "Wikipedia ist momentan nicht erreichbar oder drosselt Anfragen. " +
+          "Bitte warte und versuche es später erneut."
+        : "Es wurden keine brauchbaren Trainingsbeispiele erstellt.",
       data: [],
       articles,
       total: 0,
-      failed: articles.filter(
-        article => article.error
-      ).length
+      failed
     });
   }
 
@@ -510,17 +698,15 @@ app.post("/api/convert", async (req, res) => {
     data,
     articles,
     total: data.length,
-    failed: articles.filter(
-      article => article.error
-    ).length
+    failed
   });
 });
 
-// Ungültiges JSON im Request verständlich beantworten.
+// Fehlerbehandlung für ungültiges JSON und unerwartete Probleme.
 app.use((error, req, res, next) => {
   if (error instanceof SyntaxError && "body" in error) {
     return res.status(400).json({
-      error: "Die gesendeten Daten sind kein gültiges JSON."
+      error: "Die Anfrage enthält kein gültiges JSON."
     });
   }
 
@@ -537,7 +723,7 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server läuft auf Port ${PORT}`);
-  console.log("JSON-Konverter ist bereit.");
-  console.log("Quelle: deutsche Wikipedia-API");
-  console.log("Status: /api/status");
+  console.log("Wikipedia-JSON-Konverter bereit.");
+  console.log(`User-Agent: ${USER_AGENT}`);
+  console.log("Status-Endpunkt: /api/status");
 });
