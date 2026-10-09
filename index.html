@@ -7,138 +7,639 @@
   <title>Wikipedia zu JSON</title>
   <style>
     * { box-sizing: border-box; }
+
     body {
-      margin: 0; padding: 24px; background: #10131b;
-      color: #f2f4fa; font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 22px;
+      background: #10131b;
+      color: #f3f5fa;
+      font-family: Arial, sans-serif;
     }
-    main { max-width: 850px; margin: auto; }
+
+    main {
+      width: 100%;
+      max-width: 920px;
+      margin: auto;
+    }
+
     h1 { color: #83aaff; }
-    p { color: #b9c1d4; line-height: 1.5; }
+    h2 { font-size: 19px; }
+
+    .card {
+      background: #191e2a;
+      border: 1px solid #30384a;
+      border-radius: 14px;
+      padding: 17px;
+      margin: 16px 0;
+    }
+
     textarea, input, button {
-      width: 100%; padding: 13px; border-radius: 10px;
-      border: 1px solid #343c50; font: inherit;
+      width: 100%;
+      padding: 13px;
+      border-radius: 9px;
+      font: inherit;
     }
+
     textarea, input {
-      background: #191e2a; color: white; margin: 8px 0 14px;
+      color: white;
+      background: #10131b;
+      border: 1px solid #3a4358;
+      margin: 8px 0 12px;
     }
-    textarea { min-height: 190px; resize: vertical; }
+
+    textarea {
+      min-height: 135px;
+      resize: vertical;
+    }
+
     button {
-      background: #477cff; color: white; font-weight: bold;
-      cursor: pointer; border: 0; margin: 5px 0;
+      background: #477cff;
+      color: white;
+      font-weight: bold;
+      border: 0;
+      cursor: pointer;
+      margin: 5px 0;
     }
-    button:disabled { opacity: .5; cursor: wait; }
-    #status { white-space: pre-wrap; margin: 16px 0; }
-    pre {
-      white-space: pre-wrap; overflow-wrap: anywhere;
-      background: #191e2a; padding: 15px; border-radius: 10px;
-      max-height: 400px; overflow: auto;
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
-    .hint { font-size: 13px; }
+
+    button.secondary {
+      background: #30394c;
+    }
+
+    button.danger {
+      background: #773b45;
+    }
+
+    .row {
+      display: flex;
+      gap: 9px;
+      align-items: center;
+    }
+
+    .row button {
+      width: auto;
+      min-width: 110px;
+    }
+
+    .row input {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .small {
+      color: #b5bfd2;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    #linkList {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .linkItem {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 10px;
+      background: #10131b;
+      border: 1px solid #30384a;
+      border-radius: 9px;
+      min-width: 0;
+    }
+
+    .linkText {
+      flex: 1;
+      min-width: 0;
+      overflow-wrap: anywhere;
+      color: #bcd0ff;
+      font-size: 13px;
+    }
+
+    .linkItem button {
+      width: auto;
+      min-width: 45px;
+      padding: 9px;
+      margin: 0;
+    }
+
+    #status {
+      white-space: pre-wrap;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
+    #preview {
+      background: #10131b;
+      padding: 13px;
+      border-radius: 9px;
+      border: 1px solid #30384a;
+      max-height: 350px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 9px;
+      margin: 12px 0;
+    }
+
+    .stat {
+      background: #10131b;
+      border-radius: 9px;
+      padding: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .stat strong {
+      display: block;
+      color: #83aaff;
+      font-size: 24px;
+      margin-bottom: 5px;
+    }
+
+    .resultItem {
+      padding: 10px 0;
+      border-bottom: 1px solid #30384a;
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    .ok { color: #87dfaa; }
+    .error { color: #ff9b9b; }
+
+    @media (max-width: 520px) {
+      body { padding: 12px; }
+      .row { flex-direction: column; align-items: stretch; }
+      .row button { width: 100%; }
+      .stats { grid-template-columns: 1fr; }
+      .linkItem { align-items: flex-start; }
+    }
   </style>
 </head>
 <body>
 <main>
   <h1>Wikipedia → JSON</h1>
-  <p>Gib deutsche Wikipedia-Links ein. Der Server liest die Artikel
-     und erstellt daraus Frage-Antwort-Beispiele für deine KI.</p>
+  <p class="small">
+    Sammle mehrere deutsche Wikipedia-Links, verarbeite sie zusammen
+    und lade alle Trainingsbeispiele als eine JSON-Datei herunter.
+  </p>
 
-  <label for="links">Wikipedia-Links (ein Link pro Zeile)</label>
-  <textarea id="links" placeholder="https://de.wikipedia.org/wiki/Künstliche_Intelligenz"></textarea>
+  <section class="card">
+    <h2>1. Wikipedia-Links hinzufügen</h2>
 
-  <label for="max">Maximale Beispiele pro Artikel</label>
-  <input id="max" type="number" min="1" max="100" value="20">
+    <label for="linkInput">Links – ein Link pro Zeile</label>
+    <textarea id="linkInput"
+      placeholder="https://de.wikipedia.org/wiki/Künstliche_Intelligenz&#10;https://de.wikipedia.org/wiki/Neuronales_Netz"></textarea>
 
-  <button id="start">Artikel lesen und JSON erstellen</button>
-  <button id="download" disabled>JSON herunterladen</button>
-  <button id="copy" disabled>JSON kopieren</button>
+    <button id="addLinks">Links zur Liste hinzufügen</button>
 
-  <div id="status" role="status">Bereit.</div>
-  <h2>Vorschau</h2>
-  <pre id="preview">Hier erscheint deine JSON-Datei.</pre>
-  <p class="hint">Es werden nur Artikel auf de.wikipedia.org akzeptiert.
-     Prüfe die erzeugten Antworten vor dem Training.</p>
+    <p class="small">
+      Unterstützt werden Links zu Artikeln auf de.wikipedia.org.
+      Mehrere Links können gleichzeitig eingefügt werden.
+      Doppelte Links werden nicht erneut aufgenommen.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>2. Deine Linkliste</h2>
+
+    <div class="stats">
+      <div class="stat">
+        <strong id="linkCount">0</strong>
+        <span class="small">Artikel in der Liste</span>
+      </div>
+      <div class="stat">
+        <strong id="exampleCount">0</strong>
+        <span class="small">Erstellte Beispiele</span>
+      </div>
+      <div class="stat">
+        <strong id="failedCount">0</strong>
+        <span class="small">Fehlgeschlagene Artikel</span>
+      </div>
+    </div>
+
+    <div id="linkList">
+      <p class="small">Noch keine Links hinzugefügt.</p>
+    </div>
+
+    <button id="process" disabled>Alle Artikel gemeinsam verarbeiten</button>
+    <button id="clearLinks" class="secondary">Linkliste leeren</button>
+  </section>
+
+  <section class="card">
+    <h2>3. Verarbeitung</h2>
+    <div id="status" role="status" aria-live="polite">Bereit.</div>
+    <div id="results"></div>
+  </section>
+
+  <section class="card">
+    <h2>4. Gemeinsame JSON-Datei</h2>
+
+    <label for="maxPerArticle">Maximale Beispiele pro Artikel</label>
+    <input id="maxPerArticle" type="number" min="1" max="100" value="20">
+
+    <button id="download" disabled>Gesamte JSON herunterladen</button>
+    <button id="copy" class="secondary" disabled>JSON kopieren</button>
+
+    <pre id="preview">Noch keine JSON-Daten vorhanden.</pre>
+  </section>
 </main>
 
 <script>
-const links = document.getElementById("links");
-const maxInput = document.getElementById("max");
-const start = document.getElementById("start");
-const download = document.getElementById("download");
-const copy = document.getElementById("copy");
-const status = document.getElementById("status");
-const preview = document.getElementById("preview");
+(() => {
+  "use strict";
 
-let result = [];
+  const $ = id => document.getElementById(id);
 
-start.addEventListener("click", async () => {
-  const urls = links.value.split(/\n/)
-    .map(x => x.trim()).filter(Boolean);
+  const linkInput = $("linkInput");
+  const linkList = $("linkList");
+  const status = $("status");
+  const results = $("results");
+  const preview = $("preview");
+  const addButton = $("addLinks");
+  const processButton = $("process");
+  const downloadButton = $("download");
+  const copyButton = $("copy");
 
-  if (!urls.length) {
-    status.textContent = "Bitte mindestens einen Wikipedia-Link eingeben.";
-    return;
-  }
+  let links = [];
+  let combinedData = [];
+  let running = false;
+  let failedArticles = 0;
+  let processedArticles = 0;
 
-  start.disabled = true;
-  download.disabled = true;
-  copy.disabled = true;
-  status.textContent = "Lese Wikipedia-Artikel …";
+  function canonicalizeLink(raw) {
+    let value = raw.trim();
 
-  try {
-    const response = await fetch("/api/convert", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        urls,
-        maxPerArticle: Number(maxInput.value)
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.error || "Unbekannter Serverfehler");
+    // Ermöglicht auch das Einfügen eines Links ohne https://.
+    if (/^de\.wikipedia\.org\//i.test(value)) {
+      value = "https://" + value;
     }
 
-    result = data.data;
-    preview.textContent = JSON.stringify(result, null, 2);
+    let url;
+
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error("Ungültige URL");
+    }
+
+    // HTTP wird auf HTTPS umgestellt.
+    if (
+      url.protocol !== "http:" &&
+      url.protocol !== "https:"
+    ) {
+      throw new Error("Nur HTTP- oder HTTPS-Links sind erlaubt");
+    }
+
+    if (url.hostname.toLowerCase() !== "de.wikipedia.org") {
+      throw new Error("Nur deutsche Wikipedia-Links sind erlaubt");
+    }
+
+    if (!url.pathname.startsWith("/wiki/")) {
+      throw new Error("Das ist kein normaler Wikipedia-Artikellink");
+    }
+
+    let title;
+
+    try {
+      title = decodeURIComponent(
+        url.pathname.slice("/wiki/".length).split("/")[0]
+      );
+    } catch {
+      throw new Error("Der Artikelname ist ungültig kodiert");
+    }
+
+    if (!title || title.includes(":")) {
+      throw new Error("Bitte einen normalen Artikel statt einer Spezialseite verwenden");
+    }
+
+    url.protocol = "https:";
+    url.hostname = "de.wikipedia.org";
+    url.hash = "";
+
+    return url.href;
+  }
+
+  function renderLinks() {
+    $("linkCount").textContent = String(links.length);
+    $("exampleCount").textContent = String(combinedData.length);
+    $("failedCount").textContent = String(failedArticles);
+
+    linkList.replaceChildren();
+
+    if (links.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "small";
+      empty.textContent = "Noch keine Links hinzugefügt.";
+      linkList.appendChild(empty);
+    } else {
+      links.forEach((url, index) => {
+        const row = document.createElement("div");
+        row.className = "linkItem";
+
+        const label = document.createElement("div");
+        label.className = "linkText";
+        label.textContent = `${index + 1}. ${url}`;
+
+        const remove = document.createElement("button");
+        remove.className = "danger";
+        remove.textContent = "Entfernen";
+        remove.setAttribute("aria-label", `Link ${index + 1} entfernen`);
+
+        remove.addEventListener("click", () => {
+          links.splice(index, 1);
+          renderLinks();
+        });
+
+        row.append(label, remove);
+        linkList.appendChild(row);
+      });
+    }
+
+    processButton.disabled = running || links.length === 0;
+    $("clearLinks").disabled = running;
+    addButton.disabled = running;
+  }
+
+  function showResult(message, isError = false) {
+    const item = document.createElement("div");
+    item.className = "resultItem " + (isError ? "error" : "ok");
+    item.textContent = message;
+    results.appendChild(item);
+  }
+
+  function splitIntoBatches(items, size) {
+    const batches = [];
+
+    for (let i = 0; i < items.length; i += size) {
+      batches.push(items.slice(i, i + size));
+    }
+
+    return batches;
+  }
+
+  function normalizeExamples(items) {
+    const seen = new Set();
+    const output = [];
+
+    for (const item of items) {
+      if (
+        !item ||
+        typeof item.frage !== "string" ||
+        typeof item.antwort !== "string" ||
+        !item.frage.trim() ||
+        !item.antwort.trim()
+      ) {
+        continue;
+      }
+
+      const key = item.frage.trim() + "\n" + item.antwort.trim();
+
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      output.push({
+        frage: item.frage.trim(),
+        antwort: item.antwort.trim()
+      });
+    }
+
+    return output;
+  }
+
+  async function requestBatch(batch, limit) {
+    let response;
+
+    try {
+      response = await fetch("/api/convert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          urls: batch,
+          maxPerArticle: limit
+        })
+      });
+    } catch (error) {
+      throw new Error(
+        "Server nicht erreichbar. Prüfe die Render-Adresse und den Serverstatus."
+      );
+    }
+
+    let payload;
+
+    try {
+      payload = await response.json();
+    } catch {
+      throw new Error(
+        `Der Server hat keine gültige JSON-Antwort gesendet (HTTP ${response.status}).`
+      );
+    }
+
+    // Manche Server liefern bei Teilfehlern HTTP 422 und trotzdem Details.
+    // Erfolgreiche Beispiele werden dennoch übernommen.
+    if (Array.isArray(payload.data)) {
+      combinedData.push(...normalizeExamples(payload.data));
+    }
+
+    if (Array.isArray(payload.articles)) {
+      for (const article of payload.articles) {
+        processedArticles++;
+
+        if (article.error || Number(article.count) === 0) {
+          failedArticles++;
+          showResult(
+            `Nicht verarbeitet: ${article.title || "Unbekannter Artikel"} — ` +
+            (article.error || "Keine Beispiele erzeugt"),
+            true
+          );
+        } else {
+          showResult(
+            `OK: ${article.title || "Wikipedia-Artikel"} — ` +
+            `${article.count} Beispiele` +
+            (article.searchSource ? ` (${article.searchSource})` : "")
+          );
+        }
+      }
+    }
+
+    $("exampleCount").textContent = String(combinedData.length);
+    $("failedCount").textContent = String(failedArticles);
+
+    if (!response.ok && !Array.isArray(payload.articles)) {
+      throw new Error(
+        payload.error || `Serverfehler HTTP ${response.status}`
+      );
+    }
+
+    return payload;
+  }
+
+  function refreshJson() {
+    const json = JSON.stringify(combinedData, null, 2);
+
+    preview.textContent = combinedData.length
+      ? json
+      : "Noch keine JSON-Daten vorhanden.";
+
+    downloadButton.disabled = combinedData.length === 0;
+    copyButton.disabled = combinedData.length === 0;
+    $("exampleCount").textContent = String(combinedData.length);
+  }
+
+  addButton.addEventListener("click", () => {
+    const rawLines = linkInput.value
+      .split(/\r?\n/)
+      .map(value => value.trim())
+      .filter(Boolean);
+
+    if (rawLines.length === 0) {
+      status.textContent = "Bitte mindestens einen Wikipedia-Link einfügen.";
+      return;
+    }
+
+    let added = 0;
+    const errors = [];
+
+    for (const raw of rawLines) {
+      try {
+        const url = canonicalizeLink(raw);
+
+        if (links.includes(url)) continue;
+
+        links.push(url);
+        added++;
+      } catch (error) {
+        errors.push(`${raw} — ${error.message}`);
+      }
+    }
+
+    linkInput.value = "";
+    renderLinks();
+
     status.textContent =
-      `Fertig! ${result.length} Beispiele erstellt.\n` +
-      data.articles.map(a =>
-        `${a.title}: ${a.count} Beispiele` +
-        (a.error ? ` – ${a.error}` : "")
-      ).join("\n");
+      `${added} neue Links hinzugefügt. Insgesamt: ${links.length}.` +
+      (errors.length ? "\nNicht hinzugefügt:\n" + errors.join("\n") : "");
+  });
 
-    download.disabled = result.length === 0;
-    copy.disabled = result.length === 0;
-  } catch (error) {
-    status.textContent = "Fehler: " + error.message;
-  } finally {
-    start.disabled = false;
-  }
-});
+  $("clearLinks").addEventListener("click", () => {
+    links = [];
+    renderLinks();
+    status.textContent = "Linkliste geleert.";
+  });
 
-download.addEventListener("click", () => {
-  const blob = new Blob(
-    [JSON.stringify(result, null, 2)],
-    { type: "application/json;charset=utf-8" }
-  );
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "trainingsdaten.json";
-  a.click();
-  URL.revokeObjectURL(url);
-});
+  processButton.addEventListener("click", async () => {
+    if (running || links.length === 0) return;
 
-copy.addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
-    status.textContent = "JSON wurde in die Zwischenablage kopiert.";
-  } catch {
-    status.textContent = "Kopieren nicht möglich. Nutze den Download.";
-  }
-});
+    const limit = Number($("maxPerArticle").value);
+
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      status.textContent = "Bitte 1 bis 100 Beispiele pro Artikel einstellen.";
+      return;
+    }
+
+    running = true;
+    processButton.disabled = true;
+    addButton.disabled = true;
+    $("clearLinks").disabled = true;
+
+    combinedData = [];
+    failedArticles = 0;
+    processedArticles = 0;
+    results.replaceChildren();
+    refreshJson();
+    renderLinks();
+
+    const batches = splitIntoBatches([...links], 10);
+    let batchNumber = 0;
+    let requestErrors = 0;
+
+    status.textContent = `Starte Verarbeitung von ${links.length} Links …`;
+
+    try {
+      for (const batch of batches) {
+        batchNumber++;
+
+        status.textContent =
+          `Verarbeite Gruppe ${batchNumber} von ${batches.length} …\n` +
+          `${processedArticles} Artikel ausgewertet.`;
+
+        try {
+          await requestBatch(batch, limit);
+        } catch (error) {
+          requestErrors++;
+          failedArticles += batch.length;
+
+          showResult(
+            `Fehler bei einer Gruppe mit ${batch.length} Link(s): ${error.message}`,
+            true
+          );
+        }
+
+        refreshJson();
+      }
+
+      status.textContent =
+        `Verarbeitung abgeschlossen.\n` +
+        `Links: ${links.length}\n` +
+        `Erstellte JSON-Beispiele: ${combinedData.length}\n` +
+        `Fehlerhafte Artikel oder Gruppen: ${failedArticles}` +
+        (requestErrors ? `\nFehlerhafte Anfragen: ${requestErrors}` : "") +
+        (combinedData.length
+          ? "\nDu kannst jetzt die gesamte JSON-Datei herunterladen."
+          : "\nEs wurden keine Beispiele erzeugt. Prüfe die Render-Logs.");
+    } finally {
+      running = false;
+      renderLinks();
+      refreshJson();
+    }
+  });
+
+  downloadButton.addEventListener("click", () => {
+    if (!combinedData.length) return;
+
+    const blob = new Blob(
+      [JSON.stringify(combinedData, null, 2)],
+      { type: "application/json;charset=utf-8" }
+    );
+
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "trainingsdaten.json";
+
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+
+  copyButton.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(
+        JSON.stringify(combinedData, null, 2)
+      );
+
+      status.textContent = "Die gesamte JSON-Datei wurde kopiert.";
+    } catch {
+      status.textContent =
+        "Kopieren nicht möglich. Lade stattdessen die JSON-Datei herunter.";
+    }
+  });
+
+  renderLinks();
+  refreshJson();
+})();
 </script>
 </body>
 </html>
