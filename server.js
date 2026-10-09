@@ -11,7 +11,7 @@ const INDEX_PUBLIC = path.join(PUBLIC_DIR, "index.html");
 const INDEX_ROOT = path.join(__dirname, "index.html");
 
 const USER_AGENT =
-  "Mozilla/5.0 (compatible; WikiJSONEducationalBot/1.0)";
+  "Mozilla/5.0 (compatible; WikiJSON/2.0; educational project)";
 
 app.use(express.json({ limit: "100kb" }));
 app.use(express.static(PUBLIC_DIR));
@@ -26,55 +26,58 @@ app.get("/", (req, res) => {
   }
 
   res.status(500).send(
-    "index.html fehlt. Lege die Datei in public/ oder in den Hauptordner."
+    "index.html fehlt. Erstelle public/index.html oder lege index.html in den Hauptordner."
   );
 });
 
-app.get("/api/status", (req, res) => {
-  res.json({
-    status: "online",
-    searchEngine: "DuckDuckGo",
-    source: "de.wikipedia.org"
+async function fetchResponse(url) {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/json",
+      "Accept-Language": "de-DE,de;q=0.9"
+    },
+    signal: AbortSignal.timeout(12000),
+    redirect: "follow"
   });
-});
 
-function decodeHtml(value) {
-  return String(value || "")
-    .replace(/&#(\d+);/g, (_, n) => {
-      const code = Number(n);
-      return code <= 0x10ffff
-        ? String.fromCodePoint(code)
-        : "";
-    })
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
-      const code = parseInt(n, 16);
-      return code <= 0x10ffff
-        ? String.fromCodePoint(code)
-        : "";
-    })
-    .replace(/&nbsp;/gi, " ")
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  return {
+    text: await response.text(),
+    url: response.url
+  };
+}
+
+function decodeEntities(text) {
+  return String(text || "")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
+    .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#(\d+);/g, (_, n) => {
+      const code = Number(n);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : "";
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
+      const code = parseInt(n, 16);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : "";
+    });
 }
 
-function htmlToText(html) {
-  return decodeHtml(
-    String(html || "")
-      .replace(/<!--[\s\S]*?-->/g, " ")
-      .replace(/<(script|style|sup|noscript)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
-      .replace(/<br\s*\/?>/gi, " ")
-      .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-  )
-    .replace(/\[\s*\d+\s*\]/g, " ")
+function normalizeTitle(value) {
+  return String(value || "")
+    .replace(/_/g, " ")
     .replace(/\s+/g, " ")
-    .trim();
+    .trim()
+    .toLocaleLowerCase("de");
 }
 
-function parseWikipediaInput(input) {
+function getTitleFromWikipediaUrl(input) {
   let url;
 
   try {
@@ -89,7 +92,7 @@ function parseWikipediaInput(input) {
     !url.pathname.startsWith("/wiki/")
   ) {
     throw new Error(
-      "Nur Links von https://de.wikipedia.org/wiki/... sind erlaubt."
+      "Erlaubt sind nur Links wie https://de.wikipedia.org/wiki/Artikel"
     );
   }
 
@@ -107,56 +110,35 @@ function parseWikipediaInput(input) {
     throw new Error("Bitte einen normalen Wikipedia-Artikel verwenden.");
   }
 
-  return title.trim();
+  return title;
 }
 
-function normalizeTitle(value) {
-  return String(value || "")
-    .replace(/_/g, " ")
-    .trim()
-    .toLocaleLowerCase("de");
-}
-
-function isWikipediaArticle(value) {
+function isAllowedWikipediaUrl(value) {
   try {
     const url = new URL(value);
 
-    return (
-      url.protocol === "https:" &&
-      url.hostname === "de.wikipedia.org" &&
-      url.pathname.startsWith("/wiki/") &&
-      !decodeURIComponent(url.pathname.slice(6)).includes(":")
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "de.wikipedia.org" ||
+      !url.pathname.startsWith("/wiki/")
+    ) {
+      return false;
+    }
+
+    const title = decodeURIComponent(
+      url.pathname.slice("/wiki/".length)
     );
+
+    return Boolean(title) && !title.includes(":");
   } catch {
     return false;
   }
 }
 
-async function fetchText(url, timeout = 15000) {
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept": "text/html,application/xhtml+xml,application/json",
-      "Accept-Language": "de-DE,de;q=0.9"
-    },
-    signal: AbortSignal.timeout(timeout),
-    redirect: "follow"
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} beim Abrufen.`);
-  }
-
-  return {
-    text: await response.text(),
-    url: response.url
-  };
-}
-
 function unwrapDuckDuckGoLink(href) {
   try {
     const url = new URL(
-      decodeHtml(href),
+      decodeEntities(href),
       "https://html.duckduckgo.com"
     );
 
@@ -165,7 +147,10 @@ function unwrapDuckDuckGoLink(href) {
       url.hostname.endsWith(".duckduckgo.com")
     ) {
       const destination = url.searchParams.get("uddg");
-      if (destination) return destination;
+
+      if (destination) {
+        return new URL(destination).href;
+      }
     }
 
     return url.href;
@@ -174,216 +159,262 @@ function unwrapDuckDuckGoLink(href) {
   }
 }
 
-async function searchWikipediaWithDuckDuckGo(title) {
-  const searchUrl = new URL("https://html.duckduckgo.com/html/");
+function extractDuckDuckGoLinks(html) {
+  const results = [];
+  const anchors = html.match(/<a\b[^>]*>[\s\S]*?<\/a\s*>/gi) || [];
 
-  searchUrl.searchParams.set(
-    "q",
-    `site:de.wikipedia.org/wiki "${title}"`
-  );
-
-  const result = await fetchText(searchUrl.toString());
-
-  const anchors = [
-    ...result.text.matchAll(
-      /<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi
-    )
-  ];
-
-  const candidates = [];
-
-  for (const match of anchors) {
-    const attributes = match[1];
-
-    const classMatch = attributes.match(
-      /\bclass=["']([^"']*)["']/i
-    );
-
-    if (!classMatch || !/\bresult__a\b/.test(classMatch[1])) {
-      continue;
-    }
-
-    const hrefMatch = attributes.match(
-      /\bhref=["']([^"']+)["']/i
+  for (const anchor of anchors) {
+    const hrefMatch = anchor.match(
+      /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i
     );
 
     if (!hrefMatch) continue;
 
-    const target = unwrapDuckDuckGoLink(hrefMatch[1]);
+    const href = hrefMatch[1] || hrefMatch[2] || hrefMatch[3];
+    const target = unwrapDuckDuckGoLink(href);
 
-    if (!isWikipediaArticle(target)) continue;
+    if (!isAllowedWikipediaUrl(target)) continue;
 
-    const targetUrl = new URL(target);
-    const targetTitle = decodeURIComponent(
-      targetUrl.pathname.slice("/wiki/".length)
-    );
+    let title;
 
-    candidates.push({
-      url: targetUrl.origin + targetUrl.pathname,
-      title: targetTitle
+    try {
+      title = decodeURIComponent(
+        new URL(target).pathname.slice("/wiki/".length)
+      ).replace(/_/g, " ");
+    } catch {
+      continue;
+    }
+
+    results.push({
+      title,
+      url: "https://de.wikipedia.org/wiki/" +
+        encodeURIComponent(title.replace(/ /g, "_"))
     });
   }
 
-  const unique = [
-    ...new Map(candidates.map(item => [item.url, item])).values()
+  return [
+    ...new Map(results.map(item => [item.url, item])).values()
+  ];
+}
+
+async function searchDuckDuckGo(title) {
+  const endpoints = [
+    "https://html.duckduckgo.com/html/",
+    "https://lite.duckduckgo.com/lite/"
   ];
 
-  if (!unique.length) {
+  const query = `site:de.wikipedia.org/wiki ${title}`;
+
+  for (const endpoint of endpoints) {
+    try {
+      const url = new URL(endpoint);
+      url.searchParams.set("q", query);
+
+      const result = await fetchResponse(url.href);
+      const links = extractDuckDuckGoLinks(result.text);
+
+      if (links.length > 0) {
+        const exact = links.find(
+          item => normalizeTitle(item.title) === normalizeTitle(title)
+        );
+
+        const selected = exact || links[0];
+
+        console.log(
+          `[DuckDuckGo] ${title} -> ${selected.title}`
+        );
+
+        return {
+          ...selected,
+          searchSource: "DuckDuckGo"
+        };
+      }
+
+      console.log(
+        `[DuckDuckGo] Keine Treffer über ${endpoint}`
+      );
+    } catch (error) {
+      console.log(
+        `[DuckDuckGo] Suche fehlgeschlagen: ${error.message}`
+      );
+    }
+  }
+
+  return null;
+}
+
+async function searchWikipediaApi(title) {
+  const url = new URL("https://de.wikipedia.org/w/api.php");
+
+  url.search = new URLSearchParams({
+    action: "query",
+    list: "search",
+    srsearch: title,
+    srnamespace: "0",
+    srlimit: "5",
+    format: "json",
+    formatversion: "2"
+  }).toString();
+
+  const result = await fetchResponse(url.href);
+  const json = JSON.parse(result.text);
+  const pages = json.query?.search || [];
+
+  if (!pages.length) {
     throw new Error(
-      "DuckDuckGo lieferte keinen Wikipedia-Link. " +
-      "Die Suche könnte blockiert sein oder keine Ergebnisse haben."
+      "Weder DuckDuckGo noch die Wikipedia-Suche fanden einen Artikel."
     );
   }
 
-  const exact = unique.find(
-    item => normalizeTitle(item.title) === normalizeTitle(title)
+  const exact = pages.find(
+    page => normalizeTitle(page.title) === normalizeTitle(title)
   );
 
-  // Exakten Treffer bevorzugen; andernfalls besten Suchtreffer verwenden.
-  return exact || unique[0];
-}
+  const page = exact || pages[0];
 
-async function fetchWikipediaArticle(url) {
-  if (!isWikipediaArticle(url)) {
-    throw new Error("Der gefundene Link ist kein erlaubter Wikipedia-Link.");
-  }
-
-  const result = await fetchText(url);
-
-  // Nach Weiterleitungen nochmals die Domain kontrollieren.
-  if (!isWikipediaArticle(result.url)) {
-    throw new Error("Wikipedia hat auf eine nicht erlaubte Adresse verwiesen.");
-  }
-
-  const html = result.text;
-
-  const headingMatch = html.match(
-    /<h1\b[^>]*id=["']firstHeading["'][^>]*>([\s\S]*?)<\/h1>/i
+  console.log(
+    `[Wikipedia-Fallback] ${title} -> ${page.title}`
   );
-
-  const title = headingMatch
-    ? htmlToText(headingMatch[1])
-    : decodeURIComponent(new URL(result.url).pathname.slice(6))
-        .replace(/_/g, " ");
-
-  const start = html.search(/id=["']mw-content-text["']/i);
-
-  if (start < 0) {
-    throw new Error("Der Wikipedia-Artikeltext konnte nicht gefunden werden.");
-  }
-
-  let content = html.slice(start);
-
-  const end = content.search(
-    /id=["']catlinks["']|class=["'][^"']*printfooter/i
-  );
-
-  if (end >= 0) content = content.slice(0, end);
 
   return {
-    title,
-    url: result.url,
-    content
+    title: page.title,
+    url: "https://de.wikipedia.org/wiki/" +
+      encodeURIComponent(page.title.replace(/ /g, "_")),
+    searchSource: "Wikipedia-API-Fallback"
   };
 }
 
-function splitLongText(text, maximum = 700) {
-  if (text.length <= maximum) return [text];
+async function resolveArticle(title) {
+  const ddgResult = await searchDuckDuckGo(title);
 
-  const sentences = text.match(/[^.!?]+(?:[.!?]+|$)/g) || [text];
+  if (ddgResult) {
+    return ddgResult;
+  }
+
+  console.log(
+    `[Suche] DuckDuckGo lieferte keine auswertbaren Treffer für "${title}".`
+  );
+
+  return searchWikipediaApi(title);
+}
+
+async function getArticleText(title) {
+  const url = new URL("https://de.wikipedia.org/w/api.php");
+
+  url.search = new URLSearchParams({
+    action: "query",
+    prop: "extracts",
+    explaintext: "1",
+    exsectionformat: "plain",
+    redirects: "1",
+    titles: title,
+    format: "json",
+    formatversion: "2"
+  }).toString();
+
+  const result = await fetchResponse(url.href);
+  const json = JSON.parse(result.text);
+  const page = json.query?.pages?.[0];
+
+  if (!page || page.missing || !page.extract) {
+    throw new Error(
+      `Der Artikel "${title}" hat keinen abrufbaren Text.`
+    );
+  }
+
+  return {
+    title: page.title,
+    text: page.extract
+  };
+}
+
+function splitLongParagraph(text, maxLength = 650) {
+  if (text.length <= maxLength) {
+    return [text];
+  }
+
+  const sentences =
+    text.match(/[^.!?]+(?:[.!?]+|$)/g) || [text];
+
   const chunks = [];
   let current = "";
 
   for (const sentence of sentences) {
     const part = sentence.trim();
+
     if (!part) continue;
 
-    if (current && (current + " " + part).length > maximum) {
-      if (current.length >= 60) chunks.push(current.trim());
+    if (
+      current &&
+      (current + " " + part).length > maxLength
+    ) {
+      if (current.length >= 60) {
+        chunks.push(current.trim());
+      }
+
       current = part;
     } else {
       current = (current + " " + part).trim();
     }
   }
 
-  if (current.length >= 60) chunks.push(current.trim());
+  if (current.length >= 60) {
+    chunks.push(current.trim());
+  }
 
   return chunks;
 }
 
-function extractExamples(title, content, limit) {
-  const blocks = [];
-  const regex =
-    /<h([2-4])\b[^>]*>([\s\S]*?)<\/h\1\s*>|<p\b[^>]*>([\s\S]*?)<\/p\s*>/gi;
+function createTrainingData(title, articleText, limit) {
+  const paragraphs = articleText
+    .replace(/\[\d+\]/g, "")
+    .split(/\n+/)
+    .map(text => text.replace(/\s+/g, " ").trim())
+    .filter(text => text.length >= 60);
 
-  let currentSection = "Einleitung";
-  let excludedLevel = null;
-  let match;
+  const result = [];
+  const seen = new Set();
 
-  const excludedHeadings = new Set([
-    "einzelnachweise",
-    "literatur",
-    "weblinks",
-    "externe links",
-    "quellen",
-    "anmerkungen",
-    "siehe auch"
-  ]);
+  for (const paragraph of paragraphs) {
+    const chunks = splitLongParagraph(paragraph);
 
-  while ((match = regex.exec(content)) !== null) {
-    if (match[1]) {
-      const level = Number(match[1]);
-      const heading = htmlToText(match[2]);
+    for (const chunk of chunks) {
+      const key = chunk.toLocaleLowerCase("de");
 
-      if (excludedLevel !== null && level <= excludedLevel) {
-        excludedLevel = null;
-      }
+      if (seen.has(key)) continue;
+      seen.add(key);
 
-      if (excludedLevel !== null) continue;
-
-      if (excludedHeadings.has(heading.toLocaleLowerCase("de"))) {
-        excludedLevel = level;
-        continue;
-      }
-
-      if (heading) currentSection = heading;
-      continue;
-    }
-
-    if (excludedLevel !== null) continue;
-
-    const paragraph = htmlToText(match[3]);
-
-    if (paragraph.length < 60) continue;
-
-    for (const chunk of splitLongText(paragraph)) {
-      blocks.push({
-        section: currentSection,
-        text: chunk
+      result.push({
+        frage:
+          `Was erfährt man über ${title}? ` +
+          `(Abschnitt ${result.length + 1})`,
+        antwort: chunk
       });
 
-      if (blocks.length >= limit) return buildData(title, blocks);
+      if (result.length >= limit) {
+        return result;
+      }
     }
   }
 
-  return buildData(title, blocks);
+  return result;
 }
 
-function buildData(title, blocks) {
-  return blocks.map((block, index) => ({
-    frage:
-      `Was steht im Abschnitt „${block.section}“ ` +
-      `des Wikipedia-Artikels „${title}“ (Textabschnitt ${index + 1})?`,
-    antwort: block.text
-  }));
-}
+app.get("/api/status", (req, res) => {
+  res.json({
+    status: "online",
+    service: "Wikipedia-to-JSON",
+    primarySearch: "DuckDuckGo",
+    fallbackSearch: "Wikipedia API"
+  });
+});
 
 app.post("/api/convert", async (req, res) => {
   const { urls, maxPerArticle = 20 } = req.body || {};
 
-  if (!Array.isArray(urls) || urls.length === 0) {
+  if (!Array.isArray(urls) || urls.length < 1) {
     return res.status(400).json({
-      error: "Bitte mindestens einen Wikipedia-Link angeben."
+      error: "Gib mindestens einen Wikipedia-Link ein."
     });
   }
 
@@ -406,18 +437,17 @@ app.post("/api/convert", async (req, res) => {
 
   for (const input of urls) {
     try {
-      const requestedTitle = parseWikipediaInput(input);
+      const requestedTitle = getTitleFromWikipediaUrl(input);
 
-      // 1. Artikel über DuckDuckGo suchen.
-      const found = await searchWikipediaWithDuckDuckGo(requestedTitle);
+      // Erst DuckDuckGo, dann bei Bedarf Wikipedia als Such-Fallback.
+      const found = await resolveArticle(requestedTitle);
 
-      // 2. Den gefundenen Wikipedia-Artikel abrufen.
-      const article = await fetchWikipediaArticle(found.url);
+      // Den Text immer über die Wikipedia-API abrufen.
+      const article = await getArticleText(found.title);
 
-      // 3. Artikeltext in Frage-Antwort-Datensätze umwandeln.
-      const examples = extractExamples(
+      const examples = createTrainingData(
         article.title,
-        article.content,
+        article.text,
         limit
       );
 
@@ -425,37 +455,44 @@ app.post("/api/convert", async (req, res) => {
 
       articles.push({
         title: article.title,
-        url: article.url,
+        url: found.url,
+        searchSource: found.searchSource,
         count: examples.length
       });
 
       console.log(
-        `DuckDuckGo → Wikipedia: ${article.title} (${examples.length} Beispiele)`
+        `[Fertig] ${article.title}: ${examples.length} Beispiele`
       );
     } catch (error) {
+      console.error(
+        `[Fehler] ${String(input)}: ${error.message}`
+      );
+
       articles.push({
         title: String(input).slice(0, 150),
         count: 0,
         error: error.message
       });
-
-      console.error("Artikel konnte nicht verarbeitet werden:", error.message);
     }
   }
 
   if (data.length === 0) {
     return res.status(422).json({
       error:
-        "Keine Trainingsdaten erstellt. Prüfe die Links und die Render-Logs.",
+        "Es wurden keine Trainingsbeispiele erstellt. " +
+        "Prüfe die Links und die Render-Logs.",
       articles
     });
   }
 
-  res.json({ data, articles });
+  res.json({
+    data,
+    articles
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server läuft auf Port ${PORT}`);
-  console.log("Suchdienst: DuckDuckGo");
-  console.log("Erlaubte Quelle: de.wikipedia.org");
+  console.log("Primäre Suche: DuckDuckGo");
+  console.log("Fallback: Wikipedia-Such-API");
 });
